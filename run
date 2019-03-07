@@ -1,0 +1,129 @@
+#! /usr/bin/env python3
+
+import numpy as np, cv2, sys, os, math, random, time, torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F, collections, tensorboardX, gym
+from torch.autograd import Variable
+from torch.nn.parameter import Parameter
+from torch.distributions import Categorical
+
+# Parameters
+def arg(tag, default):
+    return type(default)((sys.argv[sys.argv.index(tag)+1])) if tag in sys.argv else default
+
+GAMMA = 0.95
+WORKERS = 16
+RENDER   = arg("--rend",  True)
+SEED     = arg("--seed",  1)
+BATCH    = arg("--batch", 64)
+BUFFER   = arg("--buf",   int(1e4))
+ROLLOUTS = arg("--eps",   100000)
+RUN_NAME = arg("--name",  "AdvantageActorCritic")
+DOMAIN   = arg("--dom",   "cartpole")
+TASK     = arg("--task",  "balance")
+ROLLOUT_LEN = arg("--rl", 20)
+
+#==============================================================================
+# Helpers
+
+def render(env):
+    cv2.namedWindow("env", cv2.WINDOW_NORMAL)
+    img = np.hstack([env.physics.render(480,480,camera_id=0), env.physics.render(480,480,camera_id=1)])
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    cv2.imshow("env", img)
+    cv2.waitKey(1)
+
+#------------------------------------------------------------------------------
+
+def select_action(obs):
+    obs    = torch.tensor(obs).float()
+    logits = actor(obs)
+    m = Categorical(logits=logits)
+    act = m.sample()
+    return act.data.numpy()
+
+#------------------------------------------------------------------------------
+
+def train_agent():
+    batch_size = ROLLOUT_LEN
+    loss_critic = []; loss_actor = []; loss_entropy = []
+    for worker in range(WORKERS):
+        obs   = torch.tensor([t[0] for t in rollouts[worker]]).float().view(batch_size, -1)
+        acts  = torch.tensor([t[1] for t in rollouts[worker]]).float().view(batch_size, -1)
+        rews  = torch.tensor([t[2] for t in rollouts[worker]]).float().view(batch_size, -1)
+        nobs  = torch.tensor([t[3] for t in rollouts[worker]]).float().view(batch_size, -1)
+        dones = torch.tensor([t[4] for t in rollouts[worker]]).float().view(batch_size, -1)
+
+        rets = [0] * (batch_size + 1)
+        rets[-1] = critic(obs[-1])
+
+        for t in reversed(range(batch_size)):
+            rets[t] = rews[t] + (1 - dones[t]) * GAMMA * rets[t+1]
+        rets = rets[:-1]
+        rets = torch.stack(rets)
+
+        advantage = rets.detach() - critic(obs)
+        loss_critic.append(torch.mean(advantage**2))
+
+        logits = actor(obs)
+        m = Categorical(logits=logits)
+        lprobs = m.log_prob(acts)
+        loss_entropy.append(torch.mean(torch.sum(F.softmax(actor(obs),dim=1) * -F.log_softmax(actor(obs),dim=1), dim=1)))
+        loss_actor.append(-torch.mean(lprobs * advantage.detach()))
+
+    loss_critic  = torch.mean(torch.stack(loss_critic))
+    loss_actor   = torch.mean(torch.stack(loss_actor))
+    loss_entropy = torch.mean(torch.stack(loss_entropy))
+
+    loss = 0.5*loss_critic + loss_actor - 0.01*loss_entropy
+
+    writer.add_scalar(RUN_NAME+"/critic_loss",  loss_critic,  update)
+    writer.add_scalar(RUN_NAME+"/actor_loss",   loss_actor,   update)
+    writer.add_scalar(RUN_NAME+"/entropy_loss", loss_entropy, update)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+#==============================================================================
+# Setup
+
+envs = [gym.make("CartPole-v0") for _ in range(WORKERS)]
+obs_size = envs[0].observation_space.shape[0]
+act_size = 1
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED);
+[env.seed(SEED) for env in envs]
+
+time_tag = str(time.time())
+writer = tensorboardX.SummaryWriter(comment = RUN_NAME)
+
+#==============================================================================
+# Run
+
+# Model
+enc =    nn.Sequential(nn.Linear(obs_size, 128), nn.ReLU(),
+                       nn.Linear(128,      128), nn.ReLU())
+actor  = nn.Sequential(enc, nn.Linear(128, 2))
+critic = nn.Sequential(enc, nn.Linear(128, 1))
+
+optimizer = optim.Adam(list(enc.parameters()) + list(actor.parameters()) + list(critic.parameters()), lr=1e-4)
+
+update = 0; lengths = [0 for _ in range(WORKERS)]
+ep_lens = [0 for _ in range(WORKERS)]
+all_obs =[env.reset() for env in envs]
+
+for i_rollout in range(ROLLOUTS):
+    rollouts = [[] for _ in range(WORKERS)]
+    for t in range(ROLLOUT_LEN):
+        acts = [select_action(obs) for obs in all_obs]
+        steps = [env.step(act) for env, act in zip(envs, acts)]
+        [rollouts[w].append((obs, np.array([acts[w]]), -1 if step[2] else 0, step[0], step[2])) for w, (step, obs) in enumerate(zip(steps, all_obs))]
+        all_obs = [env.reset() if step[2] else step[0] for step, env in zip(steps, envs)]
+        ep_lens = [length if step[2] else ep_len for length, ep_len, step in zip(lengths, ep_lens, steps)]
+        lengths = [0 if step[2] else length + 1 for length, step in zip(lengths, steps)]
+
+    train_agent()
+    update += 1
+
+    writer.add_scalar(RUN_NAME+"/Length", np.mean(ep_lens), i_rollout)
+
+
